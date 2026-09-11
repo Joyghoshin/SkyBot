@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 gradio>=4.44.0
 requests>=2.31.0
 pandas>=2.0.0
@@ -7,4 +8,3 @@ sentencepiece>=0.1.99
 accelerate>=0.30.0
 litellm>=1.50.0
 python-dotenv>=1.0.0
-streamlit
