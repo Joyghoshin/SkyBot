@@ -13,7 +13,6 @@ import requests
 import pandas as pd
 import gradio as gr
 from datetime import date, timedelta
-from transformers import pipeline
 import time
 
 from dotenv import load_dotenv
@@ -402,17 +401,18 @@ def get_llm_cumulative_data():
     )
 
 def visual_tokenize_text(input_text):
+    """
+    Educational sub-word visualizer. Previously used the local DeBERTa
+    tokenizer; now uses a simple regex word-splitter only, since the
+    local transformers/torch stack was removed to fit Render's 512MB
+    RAM limit. This was always labeled as an approximation, not a real
+    token count — the true billed count is in the LLM Inspector tab.
+    """
     if not input_text or not input_text.strip():
         return '<div style="color:#888;padding:12px;font-style:italic">Type something above to visualize...</div>'
 
-    try:
-        token_ids = topic_classifier.tokenizer.encode(input_text, add_special_tokens=False)
-        raw_pieces = topic_classifier.tokenizer.convert_ids_to_tokens(token_ids)
-        raw_pieces = [p.replace("▁", " ").replace("##", "") or " " for p in raw_pieces]
-        note = "Real sub-word tokens from an on-board BPE tokenizer (approximation — whatever LLM_MODEL is set to will tokenize slightly differently)."
-    except Exception:
-        raw_pieces = re.findall(r"\b\w+\b|\s+|[^\w\s]", input_text)
-        note = "Fallback word-splitter (tokenizer unavailable) — this is NOT real token counting."
+    raw_pieces = re.findall(r"\b\w+\b|\s+|[^\w\s]", input_text)
+    note = "Approximate word-splitter (not a real sub-word tokenizer) — this is NOT real token counting."
 
     html_elements = []
     colors = ["#E0F2FE", "#DCFCE7", "#FEF9C3", "#F3E8FF", "#FEE2E2", "#FFEDD5"]
@@ -430,21 +430,12 @@ def visual_tokenize_text(input_text):
 
     wrapper = f"""
     <div style="background: #111827; padding: 16px; border-radius: 8px; border: 1px solid #374151; min-height: 80px;">
-        <p style="color: #9CA3AF; font-size: 11px; margin: 0 0 8px 0; font-family: sans-serif;">GENERATED SUB-WORD TOKENS ({len(raw_pieces)} TOKENS):</p>
+        <p style="color: #9CA3AF; font-size: 11px; margin: 0 0 8px 0; font-family: sans-serif;">GENERATED WORD PIECES ({len(raw_pieces)} PIECES):</p>
         <div style="line-height: 2.3;">{"".join(html_elements)}</div>
         <p style="color: #64748b; font-size: 10px; margin: 10px 0 0 0; font-family: sans-serif;">ℹ️ {note} The authoritative prompt-token count is in the 🧠 LLM Inspector tab (from the real API response).</p>
     </div>
     """
     return wrapper
-
-print("⏳ Loading lightweight DeBERTa topic classifier...")
-topic_classifier = pipeline(
-    "zero-shot-classification",
-    model="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli",
-    device=-1,
-    model_kwargs={"low_cpu_mem_usage": True},
-)
-print("✅ Classifier loaded successfully!")
 
 AIRLINE_TOPICS = [
     "flight search and booking", "airport information", "travel dates and pricing",
@@ -490,28 +481,49 @@ WELCOME = "✈️ Welcome to SkyBot! I can help with flights, airports, and trav
 
 def topic_rail_check(text, history=None):
     """
-    L2 guardrail: classifies the message against AIRLINE_TOPICS vs OFF_TOPICS
-    using the zero-shot DeBERTa classifier already loaded as topic_classifier.
+    L2 guardrail: classifies the message against AIRLINE_TOPICS vs OFF_TOPICS.
 
-    NOTE: this function was missing entirely from the file (called in chat()
-    but never defined) — written fresh based on the clearly-intended purpose
-    of topic_classifier/AIRLINE_TOPICS/OFF_TOPICS/ALL_TOPICS, which existed
-    but were otherwise unused. Currently used only for logging (matching
-    chat()'s current usage, which just logs topic['top_topic'] and doesn't
-    block on it) — if you want it to actually reject off-topic messages,
-    that's a one-line addition in chat() using is_offtopic below.
+    Previously used a local DeBERTa zero-shot classifier (transformers
+    pipeline). That model plus torch pushed Render's runtime past its
+    512MB RAM limit, so this now reuses the same LiteLLM call_llm()
+    choke point as everything else in the app — no local model weights,
+    no torch, no transformers dependency.
+
+    Note: an LLM classification call doesn't produce a calibrated
+    confidence score the way the old zero-shot pipeline did, so
+    top_score is just 1.0/0.0 depending on whether a topic was matched
+    — kept in the return shape for backward compatibility with chat()
+    and any other caller that reads it.
     """
-    try:
-        result = topic_classifier(text, ALL_TOPICS, multi_label=False)
-        top_topic = result["labels"][0]
-        top_score = result["scores"][0]
-    except Exception:
+    labels_str = ", ".join(ALL_TOPICS)
+    content, ok, _, _ = call_llm(
+        "Guardrail L2 Topic Check",
+        [
+            {"role": "system", "content": (
+                "You are a topic classifier. Given a list of candidate topics and a "
+                "user message, reply with ONLY the single best-matching topic from the "
+                "list, copied exactly as written in the list. No explanation, no extra text."
+            )},
+            {"role": "user", "content": f'Topics: {labels_str}\n\nMessage: "{text}"\n\nBest matching topic:'},
+        ],
+        max_tokens=20,
+        temperature=0,
+    )
+
+    if not ok or not content:
         # Fail open: if the classifier errors for any reason, don't block chat.
         return {"top_topic": "unknown", "top_score": 0.0, "is_offtopic": False}
 
+    reply = content.strip().strip('"').strip("'").lower()
+
+    top_topic = next((t for t in ALL_TOPICS if t.lower() == reply), None)
+    if top_topic is None:
+        # Tolerant fallback in case the LLM added stray words around the label.
+        top_topic = next((t for t in ALL_TOPICS if t.lower() in reply or reply in t.lower()), "unknown")
+
     return {
         "top_topic": top_topic,
-        "top_score": round(top_score, 3),
+        "top_score": 1.0 if top_topic != "unknown" else 0.0,
         "is_offtopic": top_topic in OFF_TOPICS,
     }
 
@@ -1124,7 +1136,7 @@ with gr.Blocks(title="✈️ SkyBot — AI Airline Assistant") as demo:
 
         with gr.TabItem("🧩 Token Playground"):
             gr.HTML("<h3 style='color:#1565C0;margin:12px 0 4px 0'>🔮 Interactive Token Splitter</h3>")
-            gr.Markdown("This is an educational approximation using a real sub-word tokenizer, not necessarily the exact vocabulary of whatever LLM_MODEL is currently set. For the true billed count of anything you actually send to SkyBot, check the 🧠 LLM Inspector tab.")
+            gr.Markdown("This is an educational approximation using a simple word-splitter, not the exact vocabulary of whatever LLM_MODEL is currently set. For the true billed count of anything you actually send to SkyBot, check the 🧠 LLM Inspector tab.")
             playground_input = gr.Textbox(label="Type your phrase here:", placeholder="e.g., Search DEL to LHR", lines=2)
             playground_output = gr.HTML(value=visual_tokenize_text(""), label="Token Visualizer Screen")
             playground_input.input(fn=visual_tokenize_text, inputs=playground_input, outputs=playground_output)
