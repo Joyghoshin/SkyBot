@@ -21,6 +21,26 @@ load_dotenv()  # Loads .env into os.environ for local runs. On Render/HF,
                 # inject env vars directly — no .env file needed there.
 
 import litellm
+import threading
+
+# ── Rate-limit throttle ────────────────────────────────────────
+# Mistral's free ("Experiment") API tier enforces roughly 1 request per
+# second. A single chat turn already fires 2 LLM calls (combined L1+L2
+# guardrail, then the core chat reply) which can land inside the same
+# 1-second window and trip a 429 RateLimitError. This serializes every
+# LLM call app-wide with a minimum gap between them, so no matter how
+# many calls one turn (or multiple concurrent users) trigger, they
+# never go out faster than the free tier allows.
+_LLM_CALL_LOCK = threading.Lock()
+_LAST_LLM_CALL_TIME = [0.0]
+_MIN_LLM_CALL_INTERVAL = 1.1  # seconds
+
+def _throttle_llm_call():
+    with _LLM_CALL_LOCK:
+        wait = _MIN_LLM_CALL_INTERVAL - (time.time() - _LAST_LLM_CALL_TIME[0])
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_LLM_CALL_TIME[0] = time.time()
 
 # ── LLM Configuration ──────────────────────────────────────────
 # This ONE line is the only place a model/provider is chosen. LiteLLM's
@@ -166,6 +186,8 @@ def call_llm(feature_name, messages, max_tokens=256, temperature=None):
         "Model": LLM_MODEL,
         "Body": request_body
     }, indent=2)
+
+    _throttle_llm_call()
 
     start_time = time.time()
 
