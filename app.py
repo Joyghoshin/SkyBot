@@ -157,7 +157,6 @@ def call_llm(feature_name, messages, max_tokens=256, temperature=None):
         "model": LLM_MODEL,
         "messages": messages,
         "max_tokens": max_tokens,
-        "num_retries": 3,  # LiteLLM's built-in exponential backoff on 429s
     }
     if temperature is not None:
         request_body["temperature"] = temperature
