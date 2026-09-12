@@ -22,7 +22,6 @@ load_dotenv()  # Loads .env into os.environ for local runs. On Render/HF,
 
 import litellm
 import threading
-from openai import OpenAI as NvidiaOpenAI
 
 # ── Rate-limit throttle ────────────────────────────────────────
 # Mistral's free ("Experiment") API tier enforces roughly 1 request per
@@ -82,12 +81,10 @@ DUFFEL_VERSION  = "v2"
 # results logged to the same central llm-usage-tracker's /logEval route.
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 JUDGE_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 if not NVIDIA_API_KEY:
     print("⚠️  WARNING: NVIDIA_API_KEY is empty — eval/judge calls will be skipped.")
-    nvidia_client = None
-else:
-    nvidia_client = NvidiaOpenAI(api_key=NVIDIA_API_KEY, base_url="https://integrate.api.nvidia.com/v1")
 
 # ── Shared cross-app usage tracker (same Convex project other portfolio
 #    apps — doubtmail-ai, pcmace-ai, rootcause-ai — log to) ─────────────
@@ -280,26 +277,42 @@ def judge_reply(user_question, context, reply, task_type):
     both locally (log_usage, so it shows in this app's own dashboards)
     and to the shared cross-app tracker's /logEval route. Wrapped so a
     judge failure never blocks or breaks the actual chat reply.
+
+    Uses plain requests.post (same style as the Duffel/FX calls
+    elsewhere in this file) rather than the openai SDK, and always
+    prints the raw HTTP status + response body — this app doesn't have
+    Render Shell access (free tier), so this print is the only way to
+    see exactly what NVIDIA's API is returning when something goes wrong.
     """
-    if nvidia_client is None:
+    if not NVIDIA_API_KEY:
         return
 
     try:
         judge_start = time.time()
-        judge_response = nvidia_client.chat.completions.create(
-            model=JUDGE_MODEL,
-            messages=[{"role": "user", "content": build_judge_prompt(user_question, context, reply)}],
-            temperature=0,
-            max_tokens=512,
-            response_format={"type": "json_object"},
+        resp = requests.post(
+            NVIDIA_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {NVIDIA_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": JUDGE_MODEL,
+                "messages": [{"role": "user", "content": build_judge_prompt(user_question, context, reply)}],
+                "temperature": 0,
+                "max_tokens": 512,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=30,
         )
         judge_latency_ms = int((time.time() - judge_start) * 1000)
+        print(f"🧑‍⚖️ NVIDIA judge call -> {resp.status_code}: {resp.text[:500]}")
+        resp.raise_for_status()
+        data = resp.json()
 
-        judge_raw = judge_response.choices[0].message.content or "{}"
+        judge_raw = data["choices"][0]["message"]["content"] or "{}"
         try:
             judge_parsed = json.loads(judge_raw)
         except Exception:
-            # Best-effort: bail out quietly rather than pulling in a JSON-repair dependency.
             print(f"⚠️  Judge response wasn't valid JSON, skipping eval log: {judge_raw[:200]}")
             return
 
@@ -308,21 +321,20 @@ def judge_reply(user_question, context, reply, task_type):
         score = judge_parsed.get("score", 0)
         reasoning = judge_parsed.get("reasoning", "")
 
-        usage = getattr(judge_response, "usage", None)
-        log_usage(
-            "Judge Call",
-            JUDGE_MODEL,
-            prompt_tokens=usage.prompt_tokens if usage else 0,
-            completion_tokens=usage.completion_tokens if usage else 0,
-        )
+        usage = data.get("usage", {}) or {}
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tokens = usage.get("total_tokens", 0)
+
+        log_usage("Judge Call", JUDGE_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
 
         log_to_shared_tracker("logUsage", {
             "appName": USAGE_TRACKER_APP_NAME,
             "feature": "Judge Call",
             "model": JUDGE_MODEL,
-            "promptTokens": usage.prompt_tokens if usage else 0,
-            "completionTokens": usage.completion_tokens if usage else 0,
-            "totalTokens": usage.total_tokens if usage else 0,
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "totalTokens": total_tokens,
             "latencyMs": judge_latency_ms,
             "success": True,
         })
@@ -337,14 +349,7 @@ def judge_reply(user_question, context, reply, task_type):
             "judgeReasoning": reasoning,
         })
     except Exception as e:
-        detail = str(e)
-        resp_obj = getattr(e, "response", None)
-        if resp_obj is not None:
-            try:
-                detail += f" | status={resp_obj.status_code} body={resp_obj.text[:300]}"
-            except Exception:
-                pass
-        print(f"⚠️  LLM-as-judge pass failed (non-blocking): [{type(e).__name__}] {detail}")
+        print(f"⚠️  LLM-as-judge pass failed (non-blocking): [{type(e).__name__}] {e}")
 
 LAST_FLIGHT_API_PAYLOAD = {
     "request": "No active transaction recorded yet.",
