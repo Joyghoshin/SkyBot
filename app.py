@@ -75,22 +75,6 @@ if not DUFFEL_KEY:
 DUFFEL_BASE_URL = "https://api.duffel.com"
 DUFFEL_VERSION  = "v2"
 
-# ── LLM-as-judge (eval layer) ───────────────────────────────────
-# Matches the pattern used by pcmace-ai / rootcause-ai: a judge call to
-# NVIDIA's Nemotron model via NVIDIA's OpenAI-compatible endpoint, with
-# results logged to the same central llm-usage-tracker's /logEval route.
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
-JUDGE_MODEL = "nvidia/nemotron-3-super-120b-a12b"
-NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-
-if not NVIDIA_API_KEY:
-    print("⚠️  WARNING: NVIDIA_API_KEY is empty — eval/judge calls will be skipped.")
-else:
-    # Safe diagnostic only — never prints the full key. Checks for common
-    # corruption when pasting into Render's env var field (stray quotes,
-    # leading/trailing whitespace, wrong prefix).
-    print(f"🔑 NVIDIA_API_KEY loaded: length={len(NVIDIA_API_KEY)}, starts_with={NVIDIA_API_KEY[:7]!r}, repr_head={NVIDIA_API_KEY[:12]!r}")
-
 # ── Shared cross-app usage tracker (same Convex project other portfolio
 #    apps — doubtmail-ai, pcmace-ai, rootcause-ai — log to) ─────────────
 USAGE_TRACKER_URL = os.environ.get("USAGE_TRACKER_URL", "https://quixotic-pigeon-152.eu-west-1.convex.site")
@@ -99,106 +83,6 @@ USAGE_TRACKER_APP_NAME = os.environ.get("USAGE_TRACKER_APP_NAME", "skybot")
 
 if not USAGE_TRACKER_SECRET:
     print("⚠️  WARNING: USAGE_TRACKER_SECRET is empty — usage won't be logged to the shared tracker.")
-
-# ── LLM-as-judge eval layer ─────────────────────────────────────
-# Matches the eval pipeline already used by rootcause-ai/pcmace-ai/
-# doubtmail-ai: an NVIDIA Nemotron judge scores each core-chat reply and
-# posts the verdict to the shared tracker's /logEval endpoint. This is
-# a separate model/call from the main SkyBot conversation (LLM_MODEL) —
-# it never blocks the user's reply, since it fires in a background
-# thread (see judge_reply_async below).
-JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "nvidia_nim/nvidia/nemotron-3-super-120b-a12b")
-
-if not os.environ.get("NVIDIA_NIM_API_KEY"):
-    print("⚠️  WARNING: NVIDIA_NIM_API_KEY is empty — eval/judge scoring will be skipped (chat itself is unaffected).")
-
-JUDGE_SYSTEM = """You are an impartial evaluator judging an airline customer-service assistant's reply.
-Given the user's question, any flight-data context provided to the assistant, and the assistant's reply, rate the reply.
-
-Reply with ONLY a JSON object, no other text, in exactly this shape:
-{"score": <number between 0.0 and 1.0>, "verdict": "correct" | "partial" | "incorrect", "reasoning": "<one short sentence>"}
-
-Score/verdict guidance:
-- "correct" (score 0.8-1.0): reply directly and accurately addresses the question using the given context
-- "partial" (score 0.4-0.79): reply is relevant but incomplete, vague, or only partially uses the context
-- "incorrect" (score 0.0-0.39): reply is off-topic, wrong, or ignores the given context entirely
-"""
-
-def log_eval_to_shared_tracker(payload):
-    """
-    POSTs to the shared llm-usage-tracker's /logEval endpoint. Mirrors
-    log_to_shared_tracker but targets the evals table instead of
-    llmUsage — payload must match /logEval's expected fields exactly
-    (appName, model, judgeModel, judgeScore, judgeVerdict required;
-    taskType/mode/judgeReasoning optional).
-    """
-    if not USAGE_TRACKER_SECRET:
-        return
-    try:
-        resp = requests.post(
-            f"{USAGE_TRACKER_URL}/logEval",
-            headers={
-                "Content-Type": "application/json",
-                "x-usage-secret": USAGE_TRACKER_SECRET,
-            },
-            json=payload,
-            timeout=10,
-        )
-        print(f"📡 Eval POST /logEval -> {resp.status_code}: {resp.text[:300]}")
-    except Exception as e:
-        print(f"⚠️  Shared eval log failed (non-fatal): {e}")
-
-def judge_reply_async(user_message, context, reply):
-    """
-    Fires an LLM-as-judge evaluation of a core-chat reply in a background
-    thread, so it never adds latency to what the user sees. Silently
-    skipped if NVIDIA_NIM_API_KEY isn't set. Any failure here is
-    non-fatal and never surfaces to the chat UI.
-    """
-    if not os.environ.get("NVIDIA_NIM_API_KEY"):
-        return
-
-    def _run():
-        try:
-            judge_prompt = (
-                f"User question: {user_message}\n\n"
-                f"Flight-data context given to the assistant: {context or '(none)'}\n\n"
-                f"Assistant's reply: {reply}"
-            )
-            r = litellm.completion(
-                model=JUDGE_MODEL,
-                messages=[
-                    {"role": "system", "content": JUDGE_SYSTEM},
-                    {"role": "user", "content": judge_prompt},
-                ],
-                max_tokens=150,
-                temperature=0.0,
-            )
-            content = r.choices[0].message.content.strip()
-            # Strip stray code fences in case the judge wraps its JSON in them
-            content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.MULTILINE).strip()
-            parsed = json.loads(content)
-
-            score = float(parsed.get("score", 0.0))
-            verdict = parsed.get("verdict", "partial")
-            if verdict not in ("correct", "partial", "incorrect"):
-                verdict = "partial"
-            reasoning = str(parsed.get("reasoning", ""))[:500]
-
-            log_eval_to_shared_tracker({
-                "appName": USAGE_TRACKER_APP_NAME,
-                "taskType": "chat_reply",
-                "mode": "auto",
-                "model": LLM_MODEL,
-                "judgeModel": JUDGE_MODEL,
-                "judgeScore": score,
-                "judgeVerdict": verdict,
-                "judgeReasoning": reasoning,
-            })
-        except Exception as e:
-            print(f"⚠️  Judge eval failed (non-fatal): {e}")
-
-    threading.Thread(target=_run, daemon=True).start()
 
 def log_to_shared_tracker(endpoint, payload):
     """
@@ -229,130 +113,41 @@ USAGE_LOGS = []
 LAST_GUARDRAIL_TOKENS = 0
 LAST_CHAT_TOKENS = 0
 
-def log_eval_to_shared_tracker(payload):
+def judge_reply(user_question, context, reply, task_type):
     """
-    POSTs to the shared llm-usage-tracker's /logEval route — same
-    project/secret as log_to_shared_tracker(), different endpoint and
-    schema (score/verdict/reasoning instead of token counts).
+    LLM-as-judge eval pass. Routed through the shared llm-usage-tracker
+    Convex project's /judgeEval endpoint instead of calling NVIDIA
+    directly from Render: NVIDIA's API was returning a bare 404 to
+    every judge-model request made directly from Render's free-tier IP
+    range, even with a confirmed-working key/model/request shape (the
+    identical call succeeds from a local machine and from Convex's own
+    production cloud) — consistent with Render's shared IPs being
+    blocked or rate-limited by NVIDIA. Convex now makes the actual
+    NVIDIA call server-side and logs both the eval and the judge call's
+    usage itself; SkyBot only needs to fire one POST and never blocks
+    or breaks the chat reply if this fails.
     """
     if not USAGE_TRACKER_SECRET:
-        print("⚠️  Eval log skipped: USAGE_TRACKER_SECRET is empty.")
+        print("⚠️  Judge eval skipped: USAGE_TRACKER_SECRET is empty.")
         return
     try:
         resp = requests.post(
-            f"{USAGE_TRACKER_URL}/logEval",
+            f"{USAGE_TRACKER_URL}/judgeEval",
             headers={
                 "Content-Type": "application/json",
                 "x-usage-secret": USAGE_TRACKER_SECRET,
             },
-            json=payload,
-            timeout=10,
-        )
-        print(f"📡 Eval POST /logEval -> {resp.status_code}: {resp.text[:300]}")
-    except Exception as e:
-        print(f"⚠️  Shared eval log failed (non-fatal): {e}")
-
-def build_judge_prompt(user_question, context, reply):
-    return "\n".join([
-        "You are a strict examiner grading an airline customer-service AI's reply for accuracy and quality.",
-        "",
-        "CUSTOMER'S QUESTION:",
-        user_question,
-        "",
-        (f"LIVE DATA PROVIDED TO THE AI (e.g. real flight offers):\n{context}\n" if context else "LIVE DATA PROVIDED TO THE AI: (none for this message)\n"),
-        "AI'S REPLY:",
-        reply,
-        "",
-        "Judge whether the reply is factually consistent with any live data provided, "
-        "genuinely helpful, and appropriately scoped to an airline assistant. Penalize "
-        "invented prices/facts not present in the live data, and unhelpful or off-topic replies.",
-        "",
-        "Respond with ONLY a single valid JSON object in this exact shape, nothing else:",
-        json.dumps({
-            "score": "integer 1-5, 5 being excellent",
-            "verdict": "correct | partial | incorrect",
-            "reasoning": "one or two sentence justification",
-        }),
-    ])
-
-def judge_reply(user_question, context, reply, task_type):
-    """
-    LLM-as-judge eval pass, mirroring pcmace-ai/rootcause-ai: fires after
-    a core chat reply, scores it via NVIDIA Nemotron, and logs the result
-    both locally (log_usage, so it shows in this app's own dashboards)
-    and to the shared cross-app tracker's /logEval route. Wrapped so a
-    judge failure never blocks or breaks the actual chat reply.
-
-    Uses plain requests.post (same style as the Duffel/FX calls
-    elsewhere in this file) rather than the openai SDK, and always
-    prints the raw HTTP status + response body — this app doesn't have
-    Render Shell access (free tier), so this print is the only way to
-    see exactly what NVIDIA's API is returning when something goes wrong.
-    """
-    if not NVIDIA_API_KEY:
-        return
-
-    try:
-        judge_start = time.time()
-        resp = requests.post(
-            NVIDIA_CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {NVIDIA_API_KEY}",
-                "Content-Type": "application/json",
-            },
             json={
-                "model": JUDGE_MODEL,
-                "messages": [{"role": "user", "content": build_judge_prompt(user_question, context, reply)}],
-                "temperature": 0,
-                "max_tokens": 512,
-                "response_format": {"type": "json_object"},
+                "appName": USAGE_TRACKER_APP_NAME,
+                "taskType": task_type,
+                "model": LLM_MODEL,
+                "question": user_question,
+                "context": context or "",
+                "reply": reply,
             },
             timeout=30,
         )
-        judge_latency_ms = int((time.time() - judge_start) * 1000)
-        print(f"🧑‍⚖️ NVIDIA judge call -> {resp.status_code}: {resp.text[:500]}")
-        resp.raise_for_status()
-        data = resp.json()
-
-        judge_raw = data["choices"][0]["message"]["content"] or "{}"
-        try:
-            judge_parsed = json.loads(judge_raw)
-        except Exception:
-            print(f"⚠️  Judge response wasn't valid JSON, skipping eval log: {judge_raw[:200]}")
-            return
-
-        raw_verdict = judge_parsed.get("verdict")
-        verdict = raw_verdict if raw_verdict in ("correct", "partial", "incorrect") else "partial"
-        score = judge_parsed.get("score", 0)
-        reasoning = judge_parsed.get("reasoning", "")
-
-        usage = data.get("usage", {}) or {}
-        prompt_tokens = usage.get("prompt_tokens", 0)
-        completion_tokens = usage.get("completion_tokens", 0)
-        total_tokens = usage.get("total_tokens", 0)
-
-        log_usage("Judge Call", JUDGE_MODEL, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
-
-        log_to_shared_tracker("logUsage", {
-            "appName": USAGE_TRACKER_APP_NAME,
-            "feature": "Judge Call",
-            "model": JUDGE_MODEL,
-            "promptTokens": prompt_tokens,
-            "completionTokens": completion_tokens,
-            "totalTokens": total_tokens,
-            "latencyMs": judge_latency_ms,
-            "success": True,
-        })
-
-        log_eval_to_shared_tracker({
-            "appName": USAGE_TRACKER_APP_NAME,
-            "taskType": task_type,
-            "model": LLM_MODEL,
-            "judgeModel": JUDGE_MODEL,
-            "judgeScore": score,
-            "judgeVerdict": verdict,
-            "judgeReasoning": reasoning,
-        })
+        print(f"🧑‍⚖️ Judge eval POST /judgeEval -> {resp.status_code}: {resp.text[:300]}")
     except Exception as e:
         print(f"⚠️  LLM-as-judge pass failed (non-blocking): [{type(e).__name__}] {e}")
 
@@ -1307,8 +1102,6 @@ def chat(user_message, history):
         logs.append("🔒 L4 Validation : Clean Output Verified")
 
     judge_reply(user_message, context, final, topic["top_topic"])
-
-    judge_reply_async(user_message, context, final)
 
     history = history + [{"role":"user", "content": user_message}, {"role":"assistant", "content": final}]
 
