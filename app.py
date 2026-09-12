@@ -337,7 +337,14 @@ def judge_reply(user_question, context, reply, task_type):
             "judgeReasoning": reasoning,
         })
     except Exception as e:
-        print(f"⚠️  LLM-as-judge pass failed (non-blocking): {e}")
+        detail = str(e)
+        resp_obj = getattr(e, "response", None)
+        if resp_obj is not None:
+            try:
+                detail += f" | status={resp_obj.status_code} body={resp_obj.text[:300]}"
+            except Exception:
+                pass
+        print(f"⚠️  LLM-as-judge pass failed (non-blocking): [{type(e).__name__}] {detail}")
 
 LAST_FLIGHT_API_PAYLOAD = {
     "request": "No active transaction recorded yet.",
