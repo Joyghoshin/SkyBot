@@ -85,6 +85,11 @@ NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 if not NVIDIA_API_KEY:
     print("⚠️  WARNING: NVIDIA_API_KEY is empty — eval/judge calls will be skipped.")
+else:
+    # Safe diagnostic only — never prints the full key. Checks for common
+    # corruption when pasting into Render's env var field (stray quotes,
+    # leading/trailing whitespace, wrong prefix).
+    print(f"🔑 NVIDIA_API_KEY loaded: length={len(NVIDIA_API_KEY)}, starts_with={NVIDIA_API_KEY[:7]!r}, repr_head={NVIDIA_API_KEY[:12]!r}")
 
 # ── Shared cross-app usage tracker (same Convex project other portfolio
 #    apps — doubtmail-ai, pcmace-ai, rootcause-ai — log to) ─────────────
